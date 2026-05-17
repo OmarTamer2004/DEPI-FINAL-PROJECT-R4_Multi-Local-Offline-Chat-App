@@ -1,512 +1,941 @@
 import streamlit as st
-
-from llm_chains import (
-    load_normal_chain,
-    load_pdf_chat_chain,
-    create_llm
-)
-
-from langchain_community.chat_message_histories import (
-    StreamlitChatMessageHistory
-)
-
-from streamlit_mic_recorder import mic_recorder
-
-from audio_handler import transcribe_audio
-
-from pdf_handler import add_documents_to_db
-
-from utils import (
-    save_chat_history_json,
-    load_chat_history_json,
-    get_timestamp
-)
-
 import os
 import yaml
+import json
+import psutil
+import threading
+import glob
+from datetime import datetime
+from pathlib import Path
 
-# ---------------- CONFIG ----------------
+from langchain_community.chat_message_histories import StreamlitChatMessageHistory
+from streamlit_mic_recorder import mic_recorder
+
+from llm_chains import load_normal_chain, load_pdf_chat_chain, create_llm
+from audio_handler import transcribe_audio
+from pdf_handler import add_documents_to_db
+from utils import save_chat_history_json, load_chat_history_json, get_timestamp, sanitize_filename
+
+# ─────────────────────────────────────────────
+#  Optional GPU monitoring (graceful fallback)
+# ─────────────────────────────────────────────
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    GPU_AVAILABLE = True
+except Exception:
+    GPU_AVAILABLE = False
+
+# ─────────────────────────────────────────────
+#  CONFIG
+# ─────────────────────────────────────────────
 with open("config.yaml", "r") as f:
     config = yaml.safe_load(f)
 
-history_path = config["chat_history_path"]
+history_path     = config.get("chat_history_path", "chat_history")
+models_dir       = config.get("models_dir", "models")
+available_models = config.get("available_models", ["default"])
+
+DEFAULT_SYSTEM_PROMPT = config.get(
+    "system_prompt",
+    "You are a helpful, honest, and concise AI assistant."
+)
+
+DEFAULT_MEMORY_WINDOW = config.get("memory_window", 10)
 
 os.makedirs(history_path, exist_ok=True)
+os.makedirs(models_dir,   exist_ok=True)
 
-# ---------------- LOAD CHAIN ----------------
-def load_chain(chat_history):
+# ─────────────────────────────────────────────
+#  DARK UI + CUSTOM STYLING
+# ─────────────────────────────────────────────
+def inject_css():
+    st.markdown("""
+    <style>
 
-    if st.session_state.pdf_chat:
-        return load_pdf_chat_chain(chat_history)
+    /* ── Base dark theme ── */
+    html, body, [data-testid="stAppViewContainer"] {
+        background-color: #0f1117;
+        color: #e0e0e0;
+        font-family: 'Segoe UI', sans-serif;
+    }
 
-    return load_normal_chain(chat_history)
+    /* ── Sidebar ── */
+    [data-testid="stSidebar"] {
+        background-color: #161b25 !important;
+        border-right: 1px solid #2a2f3e;
+    }
+    [data-testid="stSidebar"] * { color: #c9d1d9 !important; }
 
-# ---------------- HELPERS ----------------
-def clear_input_field():
+    /* ── Chat bubbles ── */
+    [data-testid="stChatMessage"] {
+        background-color: #1c2130;
+        border: 1px solid #2a2f3e;
+        border-radius: 12px;
+        padding: 10px 14px;
+        margin-bottom: 8px;
+        position: relative;
+    }
 
-    st.session_state.user_question = (
-        st.session_state.user_input
+    /* ── Copy button inside chat bubble ── */
+    .copy-btn-wrapper {
+        display: flex;
+        justify-content: flex-end;
+        margin-top: 6px;
+    }
+    .copy-btn {
+        background: #1a2540;
+        border: 1px solid #2a3550;
+        border-radius: 6px;
+        color: #6e9fd4 !important;
+        cursor: pointer;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.3px;
+        padding: 3px 10px;
+        transition: all 0.18s ease;
+        user-select: none;
+    }
+    .copy-btn:hover {
+        background: #223060;
+        color: #93c5fd !important;
+        border-color: #3b5998;
+    }
+
+    /* ── Input box ── */
+    .stTextInput > div > div > input {
+        background-color: #1c2130;
+        color: #e0e0e0;
+        border: 1px solid #30363d;
+        border-radius: 8px;
+        font-size: 15px;
+        padding: 10px 14px;
+    }
+
+    /* ── Textarea (system prompt) ── */
+    .stTextArea > div > div > textarea {
+        background-color: #1c2130 !important;
+        color: #e0e0e0 !important;
+        border: 1px solid #30363d !important;
+        border-radius: 8px !important;
+        font-size: 13px !important;
+        font-family: 'Consolas', monospace !important;
+    }
+
+    /* ── All buttons base ── */
+    .stButton > button {
+        border: none;
+        border-radius: 10px;
+        font-weight: 700;
+        font-size: 15px;
+        padding: 10px 0;
+        transition: all 0.2s ease;
+        width: 100%;
+        letter-spacing: 0.3px;
+    }
+
+    /* ── Send button ── */
+    .send-btn > button {
+        background: linear-gradient(135deg, #238636, #2ea043) !important;
+        color: #ffffff !important;
+        box-shadow: 0 2px 8px rgba(35,134,54,0.35);
+    }
+    .send-btn > button:hover {
+        background: linear-gradient(135deg, #2ea043, #3fb950) !important;
+        box-shadow: 0 4px 14px rgba(35,134,54,0.5);
+        transform: translateY(-1px);
+    }
+    .send-btn > button:active { transform: translateY(0px); }
+
+    /* ── Stop button ── */
+    .stop-btn > button {
+        background: linear-gradient(135deg, #b91c1c, #da3633) !important;
+        color: #ffffff !important;
+        box-shadow: 0 2px 8px rgba(218,54,51,0.35);
+    }
+    .stop-btn > button:hover {
+        background: linear-gradient(135deg, #da3633, #f85149) !important;
+        box-shadow: 0 4px 14px rgba(218,54,51,0.5);
+        transform: translateY(-1px);
+    }
+    .stop-btn > button:active { transform: translateY(0px); }
+
+    /* ── Mic button ── */
+    .mic-btn > button {
+        background: linear-gradient(135deg, #1d4ed8, #2563eb) !important;
+        color: #ffffff !important;
+        box-shadow: 0 2px 8px rgba(37,99,235,0.35);
+        border-radius: 10px;
+        font-weight: 700;
+        font-size: 14px;
+    }
+    .mic-btn > button:hover {
+        background: linear-gradient(135deg, #2563eb, #3b82f6) !important;
+        transform: translateY(-1px);
+    }
+
+    /* ── Action row wrapper ── */
+    .action-row {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+        margin-top: 8px;
+        padding: 10px 12px;
+        background-color: #161b25;
+        border: 1px solid #2a2f3e;
+        border-radius: 14px;
+    }
+
+    /* ── Code blocks ── */
+    code, pre {
+        background-color: #161b22 !important;
+        border: 1px solid #30363d;
+        border-radius: 6px;
+        font-size: 0.85em;
+    }
+
+    /* ── Monitor card ── */
+    .monitor-card {
+        background: linear-gradient(145deg, #1a2035, #1c2540);
+        border: 1px solid #2a3550;
+        border-radius: 14px;
+        padding: 14px 16px;
+        margin-bottom: 4px;
+    }
+    .monitor-title {
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 1px;
+        text-transform: uppercase;
+        color: #6e7f9f !important;
+        margin-bottom: 10px;
+    }
+    .monitor-row {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 4px;
+    }
+    .monitor-label { font-size: 12px; color: #8b9ab5 !important; }
+    .monitor-value { font-size: 13px; font-weight: 700; color: #e2e8f0 !important; }
+    .progress-bar-bg {
+        width: 100%; background-color: #1e2d45;
+        border-radius: 99px; height: 6px; margin-bottom: 8px; overflow: hidden;
+    }
+    .progress-bar-fill-green  { height:6px;border-radius:99px;background:linear-gradient(90deg,#22c55e,#4ade80); }
+    .progress-bar-fill-blue   { height:6px;border-radius:99px;background:linear-gradient(90deg,#3b82f6,#60a5fa); }
+    .progress-bar-fill-purple { height:6px;border-radius:99px;background:linear-gradient(90deg,#a855f7,#c084fc); }
+    .progress-bar-fill-orange { height:6px;border-radius:99px;background:linear-gradient(90deg,#f97316,#fb923c); }
+    .monitor-divider { border:none;border-top:1px solid #2a3550;margin:10px 0; }
+    .gpu-badge    { display:inline-block;background:#16213a;border:1px solid #2a3550;border-radius:6px;padding:2px 8px;font-size:10px;color:#60a5fa !important;font-weight:600; }
+    .no-gpu-badge { display:inline-block;background:#1a1a2e;border:1px solid #3a3a4a;border-radius:6px;padding:2px 8px;font-size:10px;color:#6e7f9f !important; }
+
+    /* ── Title ── */
+    h1 { color: #58a6ff !important; }
+
+    /* ── Selectbox ── */
+    .stSelectbox > div > div {
+        background-color: #1c2130;
+        color: #e0e0e0;
+        border: 1px solid #30363d;
+    }
+
+    /* ── Toggle ── */
+    .stToggle { color: #58a6ff !important; }
+
+    /* ── Slider ── */
+    .stSlider [data-baseweb="slider"] { padding: 4px 0; }
+
+    /* ── Scrollbar ── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #0f1117; }
+    ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+
+    /* ── Remove iframe white border (st.components.v1.html) ── */
+    [data-testid="stSidebar"] iframe,
+    [data-testid="stSidebar"] iframe:focus {
+        border: none !important;
+        outline: none !important;
+        box-shadow: none !important;
+        display: block;
+    }
+
+    /* ── Typing animation ── */
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+    .typing-cursor::after {
+        content: '▋';
+        animation: blink 0.7s infinite;
+        color: #58a6ff;
+    }
+
+    /* ── System prompt expander badge ── */
+    .sys-badge {
+        display: inline-block;
+        background: #1a2540;
+        border: 1px solid #2a3550;
+        border-radius: 6px;
+        padding: 2px 9px;
+        font-size: 10px;
+        color: #f59e0b !important;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+        margin-left: 6px;
+    }
+
+    </style>
+
+    <!-- ── Copy-to-clipboard JS ── -->
+    <script>
+    function copyText(id) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        navigator.clipboard.writeText(el.innerText).then(() => {
+            const btn = document.querySelector('[onclick="copyText(\\''+id+'\\')"]');
+            if (btn) { btn.innerText = '✅ Copied!'; setTimeout(()=>{ btn.innerText='📋 Copy'; }, 1500); }
+        });
+    }
+    </script>
+    """, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────
+#  HARDWARE MONITOR
+#  NOTE: No `with st.sidebar:` here — this function
+#  must be called from INSIDE a `with st.sidebar:` block.
+#  The old nested sidebar context caused raw HTML to
+#  leak into the main chat area.
+# ─────────────────────────────────────────────
+def get_system_stats():
+    cpu = psutil.cpu_percent(interval=0.1)
+    ram = psutil.virtual_memory().percent
+    gpu_util = gpu_mem = gpu_name = None
+
+    if GPU_AVAILABLE:
+        try:
+            handle   = pynvml.nvmlDeviceGetHandleByIndex(0)
+            gpu_util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            gpu_mem  = round(mem_info.used / mem_info.total * 100, 1)
+            gpu_name = pynvml.nvmlDeviceGetName(handle)
+            if isinstance(gpu_name, bytes):
+                gpu_name = gpu_name.decode()
+        except Exception:
+            pass
+
+    return cpu, ram, gpu_util, gpu_mem, gpu_name
+
+
+def render_monitor():
+    """Render the hardware monitor with a clean card using st.markdown.
+    HTML is written with NO leading-space indentation so Markdown's
+    4-space code-block rule never triggers.
+    Must be called inside a `with st.sidebar:` block.
+    """
+    cpu, ram, gpu_util, gpu_mem, gpu_name = get_system_stats()
+
+    # ── helpers ──────────────────────────────────────────────────────
+    def row(icon, label, value, bar_color, pct):
+        # Each tag starts at column 0 — safe from markdown code-block rule
+        return (
+'<div style="margin-bottom:10px;">' +
+'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">' +
+f'<span style="font-size:13px;color:#c9d1d9;">{icon} {label}</span>' +
+f'<span style="font-size:13px;font-weight:700;color:#e2e8f0;">{value}%</span>' +
+'</div>' +
+'<div style="background:#1e2d45;border-radius:99px;height:7px;overflow:hidden;">' +
+f'<div style="width:{pct}%;height:7px;border-radius:99px;background:{bar_color};"></div>' +
+'</div>' +
+'</div>'
+        )
+
+    # ── build GPU block ───────────────────────────────────────────────
+    if gpu_util is not None:
+        short = (gpu_name[:20] + "…") if gpu_name and len(gpu_name) > 22 else (gpu_name or "GPU")
+        gpu_block = (
+'<div style="border-top:1px solid #2a3550;margin:8px 0 10px;"></div>' +
+f'<div style="font-size:11px;font-weight:700;color:#6e7f9f;letter-spacing:.8px;margin-bottom:8px;">🎮 GPU &nbsp;<span style="background:#16213a;border:1px solid #2a3550;border-radius:5px;padding:1px 7px;font-size:10px;color:#60a5fa;">{short}</span></div>' +
+row("⚡", "Utilization", gpu_util, "linear-gradient(90deg,#a855f7,#c084fc)", gpu_util) +
+row("🗂", "VRAM", gpu_mem, "linear-gradient(90deg,#f97316,#fb923c)", gpu_mem)
+        )
+    else:
+        gpu_block = (
+'<div style="border-top:1px solid #2a3550;margin:8px 0 10px;"></div>' +
+'<div style="display:flex;justify-content:space-between;align-items:center;">' +
+'<span style="font-size:13px;color:#c9d1d9;">🎮 GPU</span>' +
+'<span style="background:#1a1a2e;border:1px solid #3a3a4a;border-radius:5px;padding:2px 8px;font-size:10px;color:#6e7f9f;">Not Available</span>' +
+'</div>'
+        )
+
+    # ── assemble card — every line starts at column 0 ─────────────────
+    card = (
+'<div style="background:linear-gradient(145deg,#1a2035,#1c2540);border:1px solid #2a3550;border-radius:14px;padding:14px 16px;margin-bottom:4px;">' +
+'<div style="font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#6e7f9f;margin-bottom:12px;">🖥 System Monitor</div>' +
+row("🧠", "CPU", cpu, "linear-gradient(90deg,#22c55e,#4ade80)", cpu) +
+row("💾", "RAM", ram, "linear-gradient(90deg,#3b82f6,#60a5fa)", ram) +
+gpu_block +
+'</div>'
     )
 
-    st.session_state.user_input = ""
+    st.markdown(card, unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────
+#  GGUF MODEL SCANNER
+# ─────────────────────────────────────────────
+def get_gguf_models():
+    files  = glob.glob(os.path.join(models_dir, "**/*.gguf"), recursive=True)
+    files += glob.glob(os.path.join(models_dir, "*.gguf"))
+    return [os.path.basename(p) for p in files] or ["No GGUF models found"]
+
+
+# ─────────────────────────────────────────────
+#  CHAIN LOADER
+# ─────────────────────────────────────────────
+def load_chain(chat_history):
+    if st.session_state.pdf_chat:
+        return load_pdf_chat_chain(chat_history)
+    return load_normal_chain(chat_history)
+
+
+# ─────────────────────────────────────────────
+#  SESSION HELPERS
+# ─────────────────────────────────────────────
+def clear_input_field():
+    st.session_state.user_question = st.session_state.user_input
+    st.session_state.user_input    = ""
 
 def set_send_input():
-
     st.session_state.send_input = True
-
     clear_input_field()
 
 def track_index():
+    st.session_state.session_index_tracker = st.session_state.session_key
 
-    st.session_state.session_index_tracker = (
-        st.session_state.session_key
-    )
-
-# ---------------- SESSION NAME ----------------
 def generate_session_name(question):
-
-    llm = create_llm()
-
-    prompt = f"""
-    Generate a short chat title (3 to 5 words only).
-
-    User Message:
-    {question}
-
-    Rules:
-    - Return title only
-    - No quotes
-    - No special characters
-    """
-
     try:
-
-        response = llm.invoke(prompt)
-
-        title = response.strip()
-
-        invalid_chars = [
-            '\\', '/', ';', ':', '*',
-            '?', '"', '<', '>', '|'
-        ]
-
-        for c in invalid_chars:
-            title = title.replace(c, "")
-
-        title = title[:40]
-
-        if title == "":
-            title = get_timestamp()
-
-        base_title = title
-
-        counter = 1
-
-        while os.path.exists(
-            os.path.join(
-                history_path,
-                title + ".json"
-            )
-        ):
-
-            title = f"{base_title}_{counter}"
-
-            counter += 1
-
+        llm    = create_llm()
+        prompt = (
+            "Generate a short chat title (3 to 5 words only).\n"
+            f"User Message:\n{question}\n"
+            "Rules:\n- Return title only\n- No quotes\n- No special characters"
+        )
+        raw   = llm.invoke(prompt).strip().replace(" ", "_")
+        title = sanitize_filename(raw) or get_timestamp()
+        base  = title
+        i = 1
+        while os.path.exists(os.path.join(history_path, title + ".json")):
+            title = f"{base}_{i}"; i += 1
         return title
-
-    except:
-
+    except Exception:
         return get_timestamp()
 
-# ---------------- SAVE CHAT ----------------
-def save_chat_history():
 
-    if len(st.session_state.history) == 0:
+# ─────────────────────────────────────────────
+#  SAVE / LOAD HISTORY
+# ─────────────────────────────────────────────
+def save_chat_history():
+    """Persist the current chat history to disk.
+
+    IMPORTANT: never write to st.session_state.session_key directly —
+    that key is owned by the selectbox widget and Streamlit raises
+    StreamlitAPIException if you modify it from code.
+    Instead we update only session_index_tracker, which controls the
+    selectbox's `index=` parameter.  The widget will pick up the new
+    value on the next rerun and set session_key itself.
+    """
+    if not st.session_state.history:
         return
 
     if st.session_state.session_key == "new_session":
-
         if st.session_state.new_session_key is None:
+            return                          # title not generated yet — skip
+        filename = st.session_state.new_session_key
+        if not filename.endswith(".json"):
+            filename += ".json"
+        # Store normalised filename so next rerun the selectbox lands on it.
+        st.session_state.new_session_key       = filename
+        # ── Do NOT touch session_key (widget-owned) ──
+        st.session_state.session_index_tracker = filename
+    else:
+        filename = st.session_state.session_key
+        if not filename.endswith(".json"):
+            filename += ".json"
 
-            st.session_state.new_session_key = (
-                get_timestamp() + ".json"
+    path = os.path.join(history_path, filename)
+    os.makedirs(history_path, exist_ok=True)
+    save_chat_history_json(st.session_state.history, path)
+
+
+# ─────────────────────────────────────────────
+#  EXPORT CHAT
+# ─────────────────────────────────────────────
+def export_chat_as_text():
+    lines = []
+    for msg in st.session_state.history:
+        role = "You" if msg.type == "human" else "Assistant"
+        lines.append(f"[{role}]\n{msg.content}\n")
+    return "\n".join(lines)
+
+def export_chat_as_json():
+    data = [{"role": m.type, "content": m.content} for m in st.session_state.history]
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+# ─────────────────────────────────────────────
+#  STREAMING RESPONSE
+# ─────────────────────────────────────────────
+def stream_response(llm_chain, question, container, stop_event):
+    full_text   = ""
+    placeholder = container.empty()
+
+    system_prompt = st.session_state.get("system_prompt_text", "").strip()
+    if system_prompt:
+        question = f"[SYSTEM]\n{system_prompt}\n[/SYSTEM]\n\n{question}"
+
+    try:
+        for chunk in llm_chain.stream(question):
+            if stop_event.is_set():
+                break
+            token      = chunk if isinstance(chunk, str) else getattr(chunk, "content", str(chunk))
+            full_text += token
+            placeholder.markdown(
+                f'<div class="typing-cursor">{full_text}</div>',
+                unsafe_allow_html=True,
+            )
+        placeholder.markdown(full_text)
+
+    except (AttributeError, NotImplementedError):
+        with st.spinner("Thinking..."):
+            full_text = llm_chain.run(question)
+        placeholder.markdown(full_text)
+
+    return full_text
+
+
+# ─────────────────────────────────────────────
+#  RENDER MESSAGE  (markdown + code + copy btn)
+# ─────────────────────────────────────────────
+_copy_counter = 0
+
+def render_message(msg):
+    global _copy_counter
+    with st.chat_message(msg.type):
+        parts = msg.content.split("```")
+        for i, part in enumerate(parts):
+            if i % 2 == 1:
+                lines = part.split("\n", 1)
+                lang  = lines[0].strip() if lines else ""
+                code  = lines[1] if len(lines) > 1 else part
+                st.code(code, language=lang or None)
+            else:
+                if part.strip():
+                    st.markdown(part)
+
+        # Copy button — only for assistant messages
+        if msg.type == "ai":
+            _copy_counter += 1
+            uid = f"msg_copy_{_copy_counter}"
+            st.markdown(
+                f"""
+                <span id="{uid}" style="display:none">{msg.content.replace('"', '&quot;').replace('<', '&lt;')}</span>
+                <div class="copy-btn-wrapper">
+                  <button class="copy-btn" onclick="copyText('{uid}')">📋 Copy</button>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
 
-        save_path = os.path.join(
-            history_path,
-            st.session_state.new_session_key
-        )
 
-    else:
-
-        save_path = os.path.join(
-            history_path,
-            st.session_state.session_key
-        )
-
-    save_chat_history_json(
-        st.session_state.history,
-        save_path
-    )
-
-# ---------------- MAIN ----------------
+# ─────────────────────────────────────────────
+#  MAIN
+# ─────────────────────────────────────────────
 def main():
+    global _copy_counter
+    _copy_counter = 0
 
     st.set_page_config(
-        page_title="Offline Chat App",
-        page_icon="💬",
-        layout="wide"
+        page_title="Pro Chat App",
+        page_icon="🤖",
+        layout="wide",
     )
 
-    st.title("Multi Local Offline Chat App 💬")
+    inject_css()
+    st.title("🤖 Multi-Model Offline Chat")
 
     chat_container = st.container()
 
-    # ---------------- SESSION STATE ----------------
-    if "send_input" not in st.session_state:
-        st.session_state.send_input = False
+    # ── Session state defaults ──────────────────
+    defaults = {
+        "send_input":            False,
+        "user_question":         "",
+        "new_session_key":       None,
+        "session_key":           "new_session",
+        "session_index_tracker": "new_session",
+        "history":               [],
+        "pdf_chat":              False,
+        "pdf_processed":         False,
+        "stop_generation":       False,
+        "selected_model":        available_models[0] if available_models else "default",
+        "selected_gguf":         None,
+        "rename_mode":           False,
+        "system_prompt_text":    DEFAULT_SYSTEM_PROMPT,
+        "memory_window":         DEFAULT_MEMORY_WINDOW,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-    if "user_question" not in st.session_state:
-        st.session_state.user_question = ""
+    # ══════════════════════════════════════════
+    #  SIDEBAR
+    #  render_monitor() is called here — do NOT
+    #  wrap it again inside its own function.
+    # ══════════════════════════════════════════
+    with st.sidebar:
+        st.title("⚙️ Settings")
 
-    if "new_session_key" not in st.session_state:
-        st.session_state.new_session_key = None
+        # ── Hardware monitor lives entirely here ──
+        render_monitor()    # <-- single sidebar context; no nested `with st.sidebar`
+        st.divider()
 
-    if "session_key" not in st.session_state:
-        st.session_state.session_key = "new_session"
+        # ── Model selector ───────────────────────
+        st.markdown("### 🧠 Model")
+        st.selectbox("Active Model", available_models, key="selected_model")
 
-    if "session_index_tracker" not in st.session_state:
-        st.session_state.session_index_tracker = (
-            "new_session"
+        gguf_models = get_gguf_models()
+        if gguf_models[0] != "No GGUF models found":
+            st.selectbox("GGUF File", gguf_models, key="selected_gguf")
+        else:
+            st.caption("📁 Drop .gguf files into `models/` to enable GGUF switching.")
+
+        st.divider()
+
+        # ── SYSTEM PROMPT ─────────────────────
+        st.markdown("### 🗒 System Prompt")
+        with st.expander("Edit System Prompt", expanded=False):
+            st.text_area(
+                label="System Prompt",
+                key="system_prompt_text",
+                height=160,
+                help="This prompt is prepended to every message you send.",
+                label_visibility="collapsed",
+            )
+            col_reset, col_save = st.columns(2)
+            with col_reset:
+                if st.button("↩ Reset", use_container_width=True):
+                    st.session_state.system_prompt_text = DEFAULT_SYSTEM_PROMPT
+                    st.rerun()
+            with col_save:
+                if st.button("💾 Save to YAML", use_container_width=True):
+                    try:
+                        with open("config.yaml", "r") as f:
+                            cfg = yaml.safe_load(f)
+                        cfg["system_prompt"] = st.session_state.system_prompt_text
+                        with open("config.yaml", "w") as f:
+                            yaml.dump(cfg, f, allow_unicode=True)
+                        st.success("Saved!")
+                    except Exception as e:
+                        st.error(str(e))
+
+        st.divider()
+
+        # ── MEMORY WINDOW ─────────────────────
+        st.markdown("### 🧩 Memory Window")
+        st.slider(
+            "Messages to keep in context",
+            min_value=2,
+            max_value=50,
+            step=2,
+            key="memory_window",
+            help="Limits how many past messages the model sees.",
+        )
+        st.caption(
+            f"🔵 Keeping last **{st.session_state.memory_window}** messages in context."
         )
 
-    if "history" not in st.session_state:
-        st.session_state.history = []
+        st.divider()
 
-    if "pdf_chat" not in st.session_state:
-        st.session_state.pdf_chat = False
+        # ── PDF Chat toggle ──────────────────────
+        st.toggle("📄 PDF Chat Mode", key="pdf_chat", value=False)
+        st.divider()
 
-    if "pdf_processed" not in st.session_state:
-        st.session_state.pdf_processed = False
+        # ── Session list ─────────────────────────
+        st.markdown("### 💬 Chat Sessions")
 
-    # ---------------- SIDEBAR ----------------
-    st.sidebar.title("Chat Sessions")
+        session_files = sorted(
+            [
+                (f, os.path.getmtime(os.path.join(history_path, f)))
+                for f in os.listdir(history_path)
+                if f.endswith(".json")
+            ],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        chat_sessions = ["new_session"] + [f for f, _ in session_files]
 
-    chat_sessions = ["new_session"]
+        # ── FIX: clamp tracker to valid options ──────────────────────────
+        tracker = st.session_state.session_index_tracker
+        index   = chat_sessions.index(tracker) if tracker in chat_sessions else 0
 
-    # ---------------- SORT SESSIONS ----------------
-    session_files = []
+        st.selectbox(
+            "Select session",
+            chat_sessions,
+            index=index,
+            key="session_key",
+            on_change=track_index,
+        )
 
-    for file in os.listdir(history_path):
+        # ── Session actions ──────────────────────
+        if st.session_state.session_key != "new_session":
+            col_r, col_d = st.columns(2)
 
-        if file.endswith(".json"):
+            with col_r:
+                if st.button("✏️ Rename", use_container_width=True):
+                    st.session_state.rename_mode = not st.session_state.rename_mode
 
-            full_path = os.path.join(
-                history_path,
-                file
-            )
+            with col_d:
+                if st.button("🗑️ Delete", use_container_width=True):
+                    path = os.path.join(history_path, st.session_state.session_key)
+                    if os.path.exists(path):
+                        os.remove(path)
+                    st.session_state.session_key           = "new_session"
+                    st.session_state.session_index_tracker = "new_session"
+                    st.session_state.new_session_key       = None
+                    st.session_state.history               = []
+                    st.rerun()
 
-            session_files.append(
-                (
-                    file,
-                    os.path.getmtime(full_path)
+            if st.session_state.rename_mode:
+                new_name = st.text_input(
+                    "New name",
+                    value=st.session_state.session_key.replace(".json", ""),
                 )
-            )
+                if st.button("✅ Confirm Rename"):
+                    old_path = os.path.join(history_path, st.session_state.session_key)
+                    new_key  = new_name.strip().replace(" ", "_") + ".json"
+                    new_path = os.path.join(history_path, new_key)
+                    if old_path != new_path and not os.path.exists(new_path):
+                        os.rename(old_path, new_path)
+                        st.session_state.session_key           = new_key
+                        st.session_state.session_index_tracker = new_key
+                    st.session_state.rename_mode = False
+                    st.rerun()
 
-    # newest first
-    session_files.sort(
-        key=lambda x: x[1],
-        reverse=True
-    )
+        st.divider()
 
-    for file, _ in session_files:
-        chat_sessions.append(file)
+        # ── Export ───────────────────────────────
+        if st.session_state.history:
+            st.markdown("### 📤 Export Chat")
+            col_e1, col_e2 = st.columns(2)
+            with col_e1:
+                st.download_button(
+                    "📝 TXT",
+                    data=export_chat_as_text(),
+                    file_name="chat_export.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+            with col_e2:
+                st.download_button(
+                    "📦 JSON",
+                    data=export_chat_as_json(),
+                    file_name="chat_export.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
+            st.divider()
 
-    # ---------------- SESSION SELECT ----------------
-    if (
-        st.session_state.session_index_tracker
-        in chat_sessions
-    ):
-
-        index = chat_sessions.index(
-            st.session_state.session_index_tracker
+        # ── File uploads ─────────────────────────
+        uploaded_audio = st.file_uploader(
+            "🎵 Upload Audio", type=["wav", "mp3", "ogg"]
+        )
+        uploaded_pdf = st.file_uploader(
+            "📄 Upload PDFs",
+            accept_multiple_files=True,
+            key="pdf_upload",
+            type=["pdf"],
         )
 
-    else:
-        index = 0
+    if uploaded_pdf and not st.session_state.pdf_processed:
+        with st.spinner("Processing PDF…"):
+            try:
+                add_documents_to_db(uploaded_pdf)
+                st.session_state.pdf_processed = True
+                st.sidebar.success("✅ PDF added!")
+            except Exception as e:
+                st.sidebar.error(str(e))
 
-    st.sidebar.selectbox(
-        "Select a chat session",
-        chat_sessions,
-        index=index,
-        key="session_key",
-        on_change=track_index
-    )
+    # ══════════════════════════════════════════
+    #  LOAD HISTORY
+    # ══════════════════════════════════════════
+    # Determine which file to load.
+    # After saving a brand-new session, session_key is still "new_session"
+    # (widget-owned, can't be changed in code) but new_session_key holds the
+    # real filename.  Use new_session_key as a fallback in that case.
+    _active_key = st.session_state.session_key
+    if _active_key == "new_session" and st.session_state.new_session_key:
+        _active_key = st.session_state.new_session_key
 
-    # ---------------- PDF CHAT MODE ----------------
-    st.sidebar.toggle(
-        "PDF Chat Mode",
-        key="pdf_chat",
-        value=False
-    )
-
-    # ---------------- LOAD HISTORY ----------------
-    if st.session_state.session_key != "new_session":
-
+    if _active_key != "new_session":
         try:
-
-            st.session_state.history = (
-                load_chat_history_json(
-                    os.path.join(
-                        history_path,
-                        st.session_state.session_key
-                    )
-                )
+            st.session_state.history = load_chat_history_json(
+                os.path.join(history_path, _active_key)
             )
-
-        except:
-
+        except Exception:
+            st.session_state.history = []
+    else:
+        # Truly new conversation — only reset if nothing is in memory yet.
+        if not st.session_state.get("history"):
             st.session_state.history = []
 
-    else:
+    chat_history = StreamlitChatMessageHistory(key="history")
 
-        st.session_state.history = []
-
-    # ---------------- CHAT HISTORY ----------------
-    chat_history = StreamlitChatMessageHistory(
-        key="history"
-    )
+    # ── Memory window: give LLM only the last N messages ──
+    window = st.session_state.memory_window
+    _full_history_backup = list(st.session_state.history)
+    if window > 0 and len(st.session_state.history) > window:
+        st.session_state.history = st.session_state.history[-window:]
 
     llm_chain = load_chain(chat_history)
 
-    # ---------------- DISPLAY HISTORY ----------------
+    # ══════════════════════════════════════════
+    #  RENDER CHAT
+    # ══════════════════════════════════════════
     with chat_container:
+        for msg in _full_history_backup:   # always render the FULL history
+            render_message(msg)
 
-        for message in st.session_state.history:
-
-            st.chat_message(
-                message.type
-            ).write(
-                message.content
-            )
-
-    # ---------------- TEXT INPUT ----------------
+    # ══════════════════════════════════════════
+    #  INPUT BOX
+    # ══════════════════════════════════════════
     st.text_input(
-        "Type your message here...",
+        "Type your message…",
         key="user_input",
-        on_change=set_send_input
+        on_change=set_send_input,
+        placeholder="Ask anything…",
     )
 
-    col1, col2 = st.columns(2)
+    # ══════════════════════════════════════════
+    #  ACTION ROW  🎤 | 📨 Send | 🛑 Stop
+    # ══════════════════════════════════════════
+    st.markdown('<div class="action-row">', unsafe_allow_html=True)
+    col_mic, col_send, col_stop = st.columns([1.4, 1, 1])
 
-    # ---------------- MIC ----------------
-    with col1:
-
+    with col_mic:
+        st.markdown('<div class="mic-btn">', unsafe_allow_html=True)
         voice_recording = mic_recorder(
-            start_prompt="🎤 Start recording",
-            stop_prompt="⏹ Stop recording",
-            just_once=True
+            start_prompt="🎤  Start Recording",
+            stop_prompt="⏹  Stop Recording",
+            just_once=True,
         )
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    # ---------------- SEND BUTTON ----------------
-    with col2:
-
+    with col_send:
+        st.markdown('<div class="send-btn">', unsafe_allow_html=True)
         send_button = st.button(
-            "Send",
-            on_click=clear_input_field
+            "📨  Send",
+            on_click=clear_input_field,
+            use_container_width=True,
         )
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    # ---------------- AUDIO UPLOAD ----------------
-    uploaded_audio = st.sidebar.file_uploader(
-        "Upload Audio File",
-        type=["wav", "mp3", "ogg"]
-    )
+    with col_stop:
+        st.markdown('<div class="stop-btn">', unsafe_allow_html=True)
+        stop_button = st.button("🛑  Stop", use_container_width=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+        if stop_button:
+            st.session_state.stop_generation = True
 
-    # ---------------- PDF UPLOAD ----------------
-    uploaded_pdf = st.sidebar.file_uploader(
-        "Upload PDF Files",
-        accept_multiple_files=True,
-        key="pdf_upload",
-        type=["pdf"]
-    )
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    # ---------------- PDF PROCESSING ----------------
-    if (
-        uploaded_pdf
-        and not st.session_state.pdf_processed
-    ):
+    # ── Stop event ────────────────────────────
+    stop_event = threading.Event()
+    if st.session_state.stop_generation:
+        stop_event.set()
+        st.session_state.stop_generation = False
 
-        with st.spinner("Processing PDF..."):
-
-            try:
-
-                add_documents_to_db(uploaded_pdf)
-
-                st.session_state.pdf_processed = True
-
-                st.sidebar.success(
-                    "PDF Added Successfully"
-                )
-
-            except Exception as e:
-
-                st.sidebar.error(str(e))
-
-    # ---------------- AUDIO FILE ----------------
+    # ══════════════════════════════════════════
+    #  AUDIO FILE HANDLER
+    # ══════════════════════════════════════════
     if uploaded_audio:
-
         try:
-
-            with st.spinner(
-                "Transcribing Audio..."
-            ):
-
-                transcribed_audio = (
-                    transcribe_audio(
-                        uploaded_audio.getvalue()
-                    )
-                )
-
+            with st.spinner("Transcribing audio…"):
+                transcribed = transcribe_audio(uploaded_audio.getvalue())
             with chat_container:
-
-                st.chat_message(
-                    "user"
-                ).write(
-                    transcribed_audio
-                )
-
-            with st.spinner(
-                "Generating Response..."
-            ):
-
-                response = llm_chain.run(
-                    "Summarize this text:\n"
-                    + transcribed_audio
-                )
-
+                st.chat_message("human").write(transcribed)
             with chat_container:
-
-                st.chat_message(
-                    "assistant"
-                ).write(
-                    response
-                )
-
+                resp_box = st.chat_message("assistant").empty()
+            ai_reply = stream_response(llm_chain, "Summarize this text:\n" + transcribed, resp_box, stop_event)
+            from langchain_core.messages import HumanMessage, AIMessage
+            st.session_state.history = (
+                _full_history_backup
+                + [HumanMessage(content=transcribed), AIMessage(content=ai_reply)]
+            )
             save_chat_history()
-
         except Exception as e:
-
             st.error(str(e))
 
-    # ---------------- MIC RECORDING ----------------
+    # ══════════════════════════════════════════
+    #  MIC RECORDING HANDLER
+    # ══════════════════════════════════════════
     if voice_recording:
-
         try:
-
-            with st.spinner(
-                "Transcribing Voice..."
-            ):
-
-                transcribed_text = (
-                    transcribe_audio(
-                        voice_recording["bytes"]
-                    )
-                )
-
+            with st.spinner("Transcribing voice…"):
+                transcribed = transcribe_audio(voice_recording["bytes"])
             with chat_container:
-
-                st.chat_message(
-                    "user"
-                ).write(
-                    transcribed_text
-                )
-
-            with st.spinner("Thinking..."):
-
-                response = llm_chain.run(
-                    transcribed_text
-                )
-
+                st.chat_message("human").write(transcribed)
             with chat_container:
-
-                st.chat_message(
-                    "assistant"
-                ).write(
-                    response
-                )
-
+                resp_box = st.chat_message("assistant").empty()
+            ai_reply = stream_response(llm_chain, transcribed, resp_box, stop_event)
+            from langchain_core.messages import HumanMessage, AIMessage
+            st.session_state.history = (
+                _full_history_backup
+                + [HumanMessage(content=transcribed), AIMessage(content=ai_reply)]
+            )
             save_chat_history()
-
         except Exception as e:
-
             st.error(str(e))
 
-    # ---------------- TEXT CHAT ----------------
+    # ══════════════════════════════════════════
+    #  TEXT CHAT HANDLER
+    # ══════════════════════════════════════════
     if send_button or st.session_state.send_input:
-
-        question = (
-            st.session_state.user_question.strip()
-        )
-
-        if question != "":
-
+        question = st.session_state.user_question.strip()
+        if question:
             st.session_state.send_input = False
 
-            # ---------------- AUTO SESSION TITLE ----------------
+            # Generate a persistent session name on first message
             if (
-                st.session_state.session_key
-                == "new_session"
-                and st.session_state.new_session_key
-                is None
+                st.session_state.session_key == "new_session"
+                and st.session_state.new_session_key is None
             ):
-
-                session_title = (
-                    generate_session_name(
-                        question
-                    )
-                )
-
-                st.session_state.new_session_key = (
-                    session_title + ".json"
-                )
+                title = generate_session_name(question)
+                if not title.endswith(".json"):
+                    title += ".json"
+                st.session_state.new_session_key = title
 
             with chat_container:
-
-                st.chat_message(
-                    "user"
-                ).write(
-                    question
-                )
-
-            with st.spinner("Thinking..."):
-
-                response = llm_chain.run(
-                    question
-                )
+                st.chat_message("human").write(question)
 
             with chat_container:
+                resp_box = st.chat_message("assistant").empty()
 
-                st.chat_message(
-                    "assistant"
-                ).write(
-                    response
-                )
+            ai_reply = stream_response(llm_chain, question, resp_box, stop_event)
 
+            # Restore full history + append the new exchange
+            from langchain_core.messages import HumanMessage, AIMessage
+            st.session_state.history = (
+                _full_history_backup
+                + [HumanMessage(content=question), AIMessage(content=ai_reply)]
+            )
+
+            # ── save_chat_history now also promotes session_key ──
             save_chat_history()
 
-            if (
-                st.session_state.session_key
-                == "new_session"
-            ):
-
-                st.session_state.session_index_tracker = (
-                    st.session_state.new_session_key
-                )
-
             st.session_state.user_question = ""
+            st.rerun()
 
-# ---------------- RUN ----------------
+
+# ─────────────────────────────────────────────
+#  RUN
+# ─────────────────────────────────────────────
 if __name__ == "__main__":
-
     main()
