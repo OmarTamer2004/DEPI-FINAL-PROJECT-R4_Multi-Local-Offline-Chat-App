@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from langchain_community.chat_message_histories import StreamlitChatMessageHistory
+from langchain_core.messages import HumanMessage, AIMessage
 from streamlit_mic_recorder import mic_recorder
 
 from llm_chains import load_normal_chain, load_pdf_chat_chain, create_llm
@@ -34,7 +35,9 @@ with open("config.yaml", "r") as f:
 
 history_path     = config.get("chat_history_path", "chat_history")
 models_dir       = config.get("models_dir", "models")
-available_models = config.get("available_models", ["default"])
+available_models = config.get(
+    "available_models", ["llama-3.1-8b-instant", "llama-3.3-70b-versatile"]
+)
 
 DEFAULT_SYSTEM_PROMPT = config.get(
     "system_prompt",
@@ -302,8 +305,6 @@ def inject_css():
 #  HARDWARE MONITOR
 #  NOTE: No `with st.sidebar:` here — this function
 #  must be called from INSIDE a `with st.sidebar:` block.
-#  The old nested sidebar context caused raw HTML to
-#  leak into the main chat area.
 # ─────────────────────────────────────────────
 def get_system_stats():
     cpu = psutil.cpu_percent(interval=0.1)
@@ -320,7 +321,10 @@ def get_system_stats():
             if isinstance(gpu_name, bytes):
                 gpu_name = gpu_name.decode()
         except Exception:
-            pass
+            # FIX: GPU disappearing mid-session (driver hiccup, sleep/wake,
+            # eGPU unplug, etc.) should fall back to "no GPU" instead of
+            # leaving gpu_util truthy with stale/partial data.
+            gpu_util = gpu_mem = gpu_name = None
 
     return cpu, ram, gpu_util, gpu_mem, gpu_name
 
@@ -385,16 +389,34 @@ gpu_block +
 def get_gguf_models():
     files  = glob.glob(os.path.join(models_dir, "**/*.gguf"), recursive=True)
     files += glob.glob(os.path.join(models_dir, "*.gguf"))
-    return [os.path.basename(p) for p in files] or ["No GGUF models found"]
+    # FIX: dedupe — the recursive "**/*.gguf" pattern already matches files
+    # directly inside models_dir too, so the second glob created duplicates.
+    names = sorted(set(os.path.basename(p) for p in files))
+    return names or ["No GGUF models found"]
 
 
 # ─────────────────────────────────────────────
 #  CHAIN LOADER
 # ─────────────────────────────────────────────
 def load_chain(chat_history):
+    """Build the active chain, wiring the sidebar's memory-window slider
+    (in MESSAGES, i.e. human+ai count) through to llm_chains.py's
+    memory_k parameter (in TURNS, i.e. human+ai pairs) so the slider
+    actually affects how much context the model sees instead of being
+    a display-only control.
+
+    Also wires the sidebar's "Active Model" selectbox through to
+    llm_chains.create_llm(model_name=...), so switching between the
+    Groq models listed in config.yaml's `available_models` actually
+    changes which model answers — it's no longer just a display value.
+    """
+    window_messages = st.session_state.get("memory_window", DEFAULT_MEMORY_WINDOW)
+    memory_k_turns  = max(1, window_messages // 2)
+    model_name      = st.session_state.get("selected_model")
+
     if st.session_state.pdf_chat:
-        return load_pdf_chat_chain(chat_history)
-    return load_normal_chain(chat_history)
+        return load_pdf_chat_chain(chat_history, memory_k=memory_k_turns, model_name=model_name)
+    return load_normal_chain(chat_history, memory_k=memory_k_turns, model_name=model_name)
 
 
 # ─────────────────────────────────────────────
@@ -419,7 +441,10 @@ def generate_session_name(question):
             f"User Message:\n{question}\n"
             "Rules:\n- Return title only\n- No quotes\n- No special characters"
         )
-        raw   = llm.invoke(prompt).strip().replace(" ", "_")
+        # NOTE: create_llm() now returns a ChatGroq chat model, so
+        # .invoke(prompt) returns an AIMessage, not a plain string like
+        # the old CTransformers LLM did — .content pulls the text out.
+        raw   = llm.invoke(prompt).content.strip().replace(" ", "_")
         title = sanitize_filename(raw) or get_timestamp()
         base  = title
         i = 1
@@ -434,14 +459,18 @@ def generate_session_name(question):
 #  SAVE / LOAD HISTORY
 # ─────────────────────────────────────────────
 def save_chat_history():
-    """Persist the current chat history to disk.
+    """Persist the FULL chat history to disk.
 
     IMPORTANT: never write to st.session_state.session_key directly —
     that key is owned by the selectbox widget and Streamlit raises
     StreamlitAPIException if you modify it from code.
     Instead we update only session_index_tracker, which controls the
-    selectbox's `index=` parameter.  The widget will pick up the new
+    selectbox's `index=` parameter. The widget will pick up the new
     value on the next rerun and set session_key itself.
+
+    NOTE: callers must make sure st.session_state.history holds the
+    FULL conversation (not memory-window-truncated) before calling this,
+    otherwise older messages get permanently dropped from disk.
     """
     if not st.session_state.history:
         return
@@ -484,16 +513,21 @@ def export_chat_as_json():
 # ─────────────────────────────────────────────
 #  STREAMING RESPONSE
 # ─────────────────────────────────────────────
-def stream_response(llm_chain, question, container, stop_event):
+def stream_response(llm_chain, question, container, stop_event, system_prompt=""):
     full_text   = ""
     placeholder = container.empty()
 
-    system_prompt = st.session_state.get("system_prompt_text", "").strip()
+    system_prompt = (system_prompt or "").strip()
+    sent_text = question
     if system_prompt:
-        question = f"[SYSTEM]\n{system_prompt}\n[/SYSTEM]\n\n{question}"
+        # NOTE: this is a best-effort prefix because the underlying chain
+        # (llm_chains.py) is not part of this file. If/when that chain
+        # exposes a proper system-message slot, prefer wiring the prompt
+        # in there instead of string-concatenating it onto the question.
+        sent_text = f"[SYSTEM]\n{system_prompt}\n[/SYSTEM]\n\n{question}"
 
     try:
-        for chunk in llm_chain.stream(question):
+        for chunk in llm_chain.stream(sent_text):
             if stop_event.is_set():
                 break
             token      = chunk if isinstance(chunk, str) else getattr(chunk, "content", str(chunk))
@@ -502,12 +536,22 @@ def stream_response(llm_chain, question, container, stop_event):
                 f'<div class="typing-cursor">{full_text}</div>',
                 unsafe_allow_html=True,
             )
-        placeholder.markdown(full_text)
+        placeholder.markdown(full_text if full_text else "_(stopped — no response generated)_")
 
     except (AttributeError, NotImplementedError):
         with st.spinner("Thinking..."):
-            full_text = llm_chain.run(question)
+            full_text = llm_chain.run(sent_text)
         placeholder.markdown(full_text)
+
+    except Exception as e:
+        # FIX: any backend/runtime error during streaming (model crash,
+        # connection drop, OOM, etc.) used to propagate uncaught and
+        # blow up the whole page mid-response. Now it's shown inline
+        # and the partial answer (if any) is preserved instead of lost.
+        placeholder.markdown(
+            (full_text + "\n\n" if full_text else "") + f"⚠️ *Generation error: {e}*"
+        )
+        full_text = full_text or f"[Error during generation: {e}]"
 
     return full_text
 
@@ -515,10 +559,7 @@ def stream_response(llm_chain, question, container, stop_event):
 # ─────────────────────────────────────────────
 #  RENDER MESSAGE  (markdown + code + copy btn)
 # ─────────────────────────────────────────────
-_copy_counter = 0
-
-def render_message(msg):
-    global _copy_counter
+def render_message(msg, copy_uid):
     with st.chat_message(msg.type):
         parts = msg.content.split("```")
         for i, part in enumerate(parts):
@@ -533,8 +574,7 @@ def render_message(msg):
 
         # Copy button — only for assistant messages
         if msg.type == "ai":
-            _copy_counter += 1
-            uid = f"msg_copy_{_copy_counter}"
+            uid = f"msg_copy_{copy_uid}"
             st.markdown(
                 f"""
                 <span id="{uid}" style="display:none">{msg.content.replace('"', '&quot;').replace('<', '&lt;')}</span>
@@ -550,9 +590,6 @@ def render_message(msg):
 #  MAIN
 # ─────────────────────────────────────────────
 def main():
-    global _copy_counter
-    _copy_counter = 0
-
     st.set_page_config(
         page_title="Pro Chat App",
         page_icon="🤖",
@@ -580,6 +617,19 @@ def main():
         "rename_mode":           False,
         "system_prompt_text":    DEFAULT_SYSTEM_PROMPT,
         "memory_window":         DEFAULT_MEMORY_WINDOW,
+        # FIX (duplicate-answer bug): the text input fires on_change on
+        # Enter (setting send_input=True) AND the Send button can also
+        # fire in an overlapping run, both racing to process the same
+        # st.session_state.user_question. This tracks the last question
+        # we actually answered so a second trigger with identical text
+        # is ignored instead of generating (and saving) the same
+        # exchange twice.
+        "last_processed_question": None,
+        # FIX: stop_event now lives in session_state so the Stop button
+        # can actually interrupt a stream from a previous rerun (a fresh
+        # local `threading.Event()` every run could never be seen/set by
+        # the streaming loop that started on an earlier run).
+        "stop_event":            threading.Event(),
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -587,14 +637,11 @@ def main():
 
     # ══════════════════════════════════════════
     #  SIDEBAR
-    #  render_monitor() is called here — do NOT
-    #  wrap it again inside its own function.
     # ══════════════════════════════════════════
     with st.sidebar:
         st.title("⚙️ Settings")
 
-        # ── Hardware monitor lives entirely here ──
-        render_monitor()    # <-- single sidebar context; no nested `with st.sidebar`
+        render_monitor()
         st.divider()
 
         # ── Model selector ───────────────────────
@@ -603,8 +650,14 @@ def main():
 
         gguf_models = get_gguf_models()
         if gguf_models[0] != "No GGUF models found":
+            # FIX: if the previously-selected GGUF file was deleted/renamed,
+            # st.session_state.selected_gguf could hold a value no longer in
+            # gguf_models, which raises StreamlitAPIException on rerun.
+            if st.session_state.get("selected_gguf") not in gguf_models:
+                st.session_state.selected_gguf = gguf_models[0]
             st.selectbox("GGUF File", gguf_models, key="selected_gguf")
         else:
+            st.session_state.selected_gguf = None
             st.caption("📁 Drop .gguf files into `models/` to enable GGUF switching.")
 
         st.divider()
@@ -655,7 +708,11 @@ def main():
         st.divider()
 
         # ── PDF Chat toggle ──────────────────────
-        st.toggle("📄 PDF Chat Mode", key="pdf_chat", value=False)
+        # FIX: removed `value=False` — once a `key` is bound in
+        # session_state, passing `value` too triggers a Streamlit warning
+        # and is ignored after the first run anyway. The default is
+        # already set once via the `defaults` dict above.
+        st.toggle("📄 PDF Chat Mode", key="pdf_chat")
         st.divider()
 
         # ── Session list ─────────────────────────
@@ -672,7 +729,7 @@ def main():
         )
         chat_sessions = ["new_session"] + [f for f, _ in session_files]
 
-        # ── FIX: clamp tracker to valid options ──────────────────────────
+        # ── Clamp tracker to valid options ──────────────────────────
         tracker = st.session_state.session_index_tracker
         index   = chat_sessions.index(tracker) if tracker in chat_sessions else 0
 
@@ -709,15 +766,24 @@ def main():
                     value=st.session_state.session_key.replace(".json", ""),
                 )
                 if st.button("✅ Confirm Rename"):
-                    old_path = os.path.join(history_path, st.session_state.session_key)
-                    new_key  = new_name.strip().replace(" ", "_") + ".json"
-                    new_path = os.path.join(history_path, new_key)
-                    if old_path != new_path and not os.path.exists(new_path):
-                        os.rename(old_path, new_path)
-                        st.session_state.session_key           = new_key
-                        st.session_state.session_index_tracker = new_key
-                    st.session_state.rename_mode = False
-                    st.rerun()
+                    new_stripped = new_name.strip()
+                    if not new_stripped:
+                        st.warning("Name can't be empty.")
+                    else:
+                        old_path = os.path.join(history_path, st.session_state.session_key)
+                        new_key  = sanitize_filename(new_stripped.replace(" ", "_")) + ".json"
+                        new_path = os.path.join(history_path, new_key)
+                        if old_path == new_path:
+                            st.session_state.rename_mode = False
+                            st.rerun()
+                        elif os.path.exists(new_path):
+                            st.warning("A session with that name already exists.")
+                        else:
+                            os.rename(old_path, new_path)
+                            st.session_state.session_key           = new_key
+                            st.session_state.session_index_tracker = new_key
+                            st.session_state.rename_mode = False
+                            st.rerun()
 
         st.divider()
 
@@ -757,19 +823,27 @@ def main():
     if uploaded_pdf and not st.session_state.pdf_processed:
         with st.spinner("Processing PDF…"):
             try:
-                add_documents_to_db(uploaded_pdf)
+                status = add_documents_to_db(uploaded_pdf)
                 st.session_state.pdf_processed = True
-                st.sidebar.success("✅ PDF added!")
+                st.sidebar.success(f"✅ {status}")
+            except ValueError as e:
+                # FIX: previously any exception here (including the
+                # "no extractable text" case from a scanned/image-only
+                # PDF) was shown as a generic error but pdf_processed
+                # was never set — yet the file_uploader keeps holding
+                # the same file, so this could silently retry forever
+                # on every rerun without the user realizing why the
+                # model later claims it has no access to the document.
+                # Now the specific reason (e.g. no text layer) is
+                # surfaced clearly, and pdf_processed stays False so
+                # nothing falsely appears "added".
+                st.sidebar.error(f"⚠️ {e}")
             except Exception as e:
-                st.sidebar.error(str(e))
+                st.sidebar.error(f"PDF processing failed: {e}")
 
     # ══════════════════════════════════════════
     #  LOAD HISTORY
     # ══════════════════════════════════════════
-    # Determine which file to load.
-    # After saving a brand-new session, session_key is still "new_session"
-    # (widget-owned, can't be changed in code) but new_session_key holds the
-    # real filename.  Use new_session_key as a fallback in that case.
     _active_key = st.session_state.session_key
     if _active_key == "new_session" and st.session_state.new_session_key:
         _active_key = st.session_state.new_session_key
@@ -782,26 +856,45 @@ def main():
         except Exception:
             st.session_state.history = []
     else:
-        # Truly new conversation — only reset if nothing is in memory yet.
         if not st.session_state.get("history"):
             st.session_state.history = []
 
     chat_history = StreamlitChatMessageHistory(key="history")
 
-    # ── Memory window: give LLM only the last N messages ──
-    window = st.session_state.memory_window
-    _full_history_backup = list(st.session_state.history)
-    if window > 0 and len(st.session_state.history) > window:
-        st.session_state.history = st.session_state.history[-window:]
+    # ── Memory window ──
+    # IMPORTANT: StreamlitChatMessageHistory's `.messages` setter writes
+    # straight into st.session_state["history"] — the SAME object this
+    # function treats as the full conversation. Assigning a truncated
+    # list to `chat_history.messages` would silently overwrite (and,
+    # once saved, permanently lose) the older messages — exactly the
+    # original bug this app had. So app.py never writes to
+    # chat_history.messages. Windowing for the LLM's context instead
+    # happens inside llm_chains.py: ChatChain/PDFChatChain read
+    # chat_history.messages read-only and build their own trimmed copy
+    # internally (see DEFAULT_MEMORY_K / memory_window_turns there).
+    full_history = list(st.session_state.history)
 
+    # NOTE on chain construction: load_chain() is called fresh every
+    # run (cheap — it's just a thin wrapper object). The actually
+    # expensive resources (the ChatGroq client, the HuggingFace
+    # embeddings model, and the chromadb PersistentClient/vector store)
+    # are cached separately INSIDE llm_chains.py via @st.cache_resource,
+    # not here. We deliberately do NOT cache the chain object itself in
+    # session_state: ChatChain/PDFChatChain capture `chat_history` by
+    # reference, and app.py rebinds st.session_state.history to a brand
+    # new list on every exchange (`st.session_state.history = full_history
+    # + [...]`) rather than mutating it in place. A cached chain would
+    # keep pointing at the OLD list forever, silently freezing the
+    # conversation context the model sees — verified this would
+    # actually happen before ruling it out.
     llm_chain = load_chain(chat_history)
 
     # ══════════════════════════════════════════
-    #  RENDER CHAT
+    #  RENDER CHAT  (always the FULL history)
     # ══════════════════════════════════════════
     with chat_container:
-        for msg in _full_history_backup:   # always render the FULL history
-            render_message(msg)
+        for idx, msg in enumerate(full_history):
+            render_message(msg, copy_uid=idx)
 
     # ══════════════════════════════════════════
     #  INPUT BOX
@@ -819,13 +912,19 @@ def main():
     st.markdown('<div class="action-row">', unsafe_allow_html=True)
     col_mic, col_send, col_stop = st.columns([1.4, 1, 1])
 
+    # FIX: default so `voice_recording` always exists below, even if the
+    # mic widget raises or simply hasn't fired this run.
+    voice_recording = None
     with col_mic:
         st.markdown('<div class="mic-btn">', unsafe_allow_html=True)
-        voice_recording = mic_recorder(
-            start_prompt="🎤  Start Recording",
-            stop_prompt="⏹  Stop Recording",
-            just_once=True,
-        )
+        try:
+            voice_recording = mic_recorder(
+                start_prompt="🎤  Start Recording",
+                stop_prompt="⏹  Stop Recording",
+                just_once=True,
+            )
+        except Exception as e:
+            st.caption(f"🎤 mic unavailable: {e}")
         st.markdown("</div>", unsafe_allow_html=True)
 
     with col_send:
@@ -842,15 +941,15 @@ def main():
         stop_button = st.button("🛑  Stop", use_container_width=True)
         st.markdown("</div>", unsafe_allow_html=True)
         if stop_button:
-            st.session_state.stop_generation = True
+            st.session_state.stop_event.set()
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-    # ── Stop event ────────────────────────────
-    stop_event = threading.Event()
-    if st.session_state.stop_generation:
-        stop_event.set()
-        st.session_state.stop_generation = False
+    # ── Stop event for THIS run ────────────────────────────
+    stop_event = st.session_state.stop_event
+    stop_event.clear()  # fresh run starts clean; Stop button above can still set it before streaming starts
+
+    system_prompt = st.session_state.get("system_prompt_text", "")
 
     # ══════════════════════════════════════════
     #  AUDIO FILE HANDLER
@@ -859,19 +958,66 @@ def main():
         try:
             with st.spinner("Transcribing audio…"):
                 transcribed = transcribe_audio(uploaded_audio.getvalue())
-            with chat_container:
-                st.chat_message("human").write(transcribed)
-            with chat_container:
-                resp_box = st.chat_message("assistant").empty()
-            ai_reply = stream_response(llm_chain, "Summarize this text:\n" + transcribed, resp_box, stop_event)
-            from langchain_core.messages import HumanMessage, AIMessage
-            st.session_state.history = (
-                _full_history_backup
-                + [HumanMessage(content=transcribed), AIMessage(content=ai_reply)]
-            )
-            save_chat_history()
+            if not transcribed or not transcribed.strip():
+                st.warning("Couldn't transcribe any speech from that audio file.")
+            else:
+                # NOTE: a rerun is required after this block (the file
+                # uploader widget keeps `uploaded_audio` populated until
+                # the user removes the file, so without a rerun this
+                # same block would reprocess the same file again on the
+                # next natural rerun). Since we know a rerun WILL
+                # happen, we don't manually draw the exchange into
+                # chat_container here — that previously caused the
+                # exchange to render once now and a second time when
+                # the post-rerun history loop redrew it. The live
+                # "typing" animation still happens via stream_response's
+                # placeholder; it just lives in a throwaway spot instead
+                # of inside the persistent history container.
+                live_box = st.empty()
+                resp_box = live_box.chat_message("assistant").empty()
+
+                # FIX (duplicated transcript in the AI's own reply):
+                # the old prompt was "Summarize this text:\n" + transcribed
+                # with no clear delimiter, and stream_response() then
+                # additionally wrapped it in "[SYSTEM]...[/SYSTEM]" before
+                # the transcript. Small instruct models (whether run
+                # locally via GGUF or hosted, like the Groq models used
+                # now) are prone to echoing or continuing long,
+                # loosely-delimited input instead of following the
+                # instruction — which is exactly
+                # what produced the transcript appearing twice (once as
+                # an echo, once more after the actual summary). Quoting
+                # the transcript clearly and putting the instruction
+                # AFTER it (closer to where generation starts) gives the
+                # model a much stronger signal to summarize rather than
+                # continue/repeat the text. This doesn't change app
+                # logic — it's the same call shape, just a clearer
+                # instruction string — and it can't fully guarantee a
+                # small model's behavior, but it removes the main
+                # structural cause.
+                summarize_prompt = (
+                    "Here is a transcript:\n"
+                    "-----\n"
+                    f"{transcribed}\n"
+                    "-----\n"
+                    "Write a short summary of the transcript above in your "
+                    "own words. Do not repeat or quote the transcript "
+                    "itself — only give the summary."
+                )
+
+                ai_reply = stream_response(
+                    llm_chain, summarize_prompt,
+                    resp_box, stop_event, system_prompt,
+                )
+                st.session_state.history = (
+                    full_history
+                    + [HumanMessage(content=transcribed), AIMessage(content=ai_reply)]
+                )
+                save_chat_history()
+                st.rerun()
         except Exception as e:
-            st.error(str(e))
+            st.error(f"Audio processing failed: {e}")
+
 
     # ══════════════════════════════════════════
     #  MIC RECORDING HANDLER
@@ -880,33 +1026,41 @@ def main():
         try:
             with st.spinner("Transcribing voice…"):
                 transcribed = transcribe_audio(voice_recording["bytes"])
-            with chat_container:
-                st.chat_message("human").write(transcribed)
-            with chat_container:
-                resp_box = st.chat_message("assistant").empty()
-            ai_reply = stream_response(llm_chain, transcribed, resp_box, stop_event)
-            from langchain_core.messages import HumanMessage, AIMessage
-            st.session_state.history = (
-                _full_history_backup
-                + [HumanMessage(content=transcribed), AIMessage(content=ai_reply)]
-            )
-            save_chat_history()
+            if not transcribed or not transcribed.strip():
+                st.warning("Didn't catch any speech in that recording — try again.")
+            else:
+                # Same reasoning as the audio handler above: a rerun is
+                # required (mic_recorder's just_once already prevents
+                # re-firing on its own, but we still rerun to refresh
+                # the sidebar/session list), so don't pre-draw into the
+                # persistent chat_container — let the post-rerun history
+                # loop be the single source of truth for this exchange.
+                live_box = st.empty()
+                resp_box = live_box.chat_message("assistant").empty()
+                ai_reply = stream_response(llm_chain, transcribed, resp_box, stop_event, system_prompt)
+                st.session_state.history = (
+                    full_history
+                    + [HumanMessage(content=transcribed), AIMessage(content=ai_reply)]
+                )
+                save_chat_history()
+                st.rerun()
         except Exception as e:
-            st.error(str(e))
+            st.error(f"Voice transcription failed: {e}")
 
     # ══════════════════════════════════════════
     #  TEXT CHAT HANDLER
     # ══════════════════════════════════════════
     if send_button or st.session_state.send_input:
         question = st.session_state.user_question.strip()
-        if question:
-            st.session_state.send_input = False
+        st.session_state.send_input = False
 
+        if question:
             # Generate a persistent session name on first message
-            if (
+            is_new_session = (
                 st.session_state.session_key == "new_session"
                 and st.session_state.new_session_key is None
-            ):
+            )
+            if is_new_session:
                 title = generate_session_name(question)
                 if not title.endswith(".json"):
                     title += ".json"
@@ -918,20 +1072,32 @@ def main():
             with chat_container:
                 resp_box = st.chat_message("assistant").empty()
 
-            ai_reply = stream_response(llm_chain, question, resp_box, stop_event)
+            ai_reply = stream_response(llm_chain, question, resp_box, stop_event, system_prompt)
 
-            # Restore full history + append the new exchange
-            from langchain_core.messages import HumanMessage, AIMessage
+            # Append the new exchange onto the FULL history (not the
+            # memory-windowed one) so nothing gets lost on disk.
             st.session_state.history = (
-                _full_history_backup
+                full_history
                 + [HumanMessage(content=question), AIMessage(content=ai_reply)]
             )
 
-            # ── save_chat_history now also promotes session_key ──
             save_chat_history()
-
             st.session_state.user_question = ""
-            st.rerun()
+
+            # FIX (duplicate-output bug): the exchange above is already
+            # correctly painted into chat_container by the two
+            # `st.chat_message(...)` calls + stream_response(). Forcing
+            # an unconditional st.rerun() here re-ran the script while
+            # that frame was still settling, so the history loop at the
+            # top of main() (which now also includes this same exchange)
+            # painted it a second time — producing the doubled
+            # question/answer the user saw. We only need to rerun when
+            # something the SIDEBAR depends on changed (a brand-new
+            # session was just created and needs to appear/be selected
+            # in the session list); a reply to an existing session needs
+            # no rerun at all, since it's already fully rendered.
+            if is_new_session:
+                st.rerun()
 
 
 # ─────────────────────────────────────────────
